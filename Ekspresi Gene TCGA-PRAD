@@ -106,14 +106,16 @@ p_multi <- ggplot(data_long, aes(x = gene, y = expr, fill = group_expr)) +
                     labels = c(paste0("Normal (n=", n_table["Normal"], ")"),
                                paste0("Tumor (n=", n_table["Tumor"], ")"))) +
   scale_colour_manual(values = warna, guide = "none") +
-  labs(title = "TCGA-PRAD: Ekspresi 8 Gen, Normal vs Tumor",
+  labs(title = "TCGA-PRAD",
        x = "", y = "Expression Level (log2 TPM+1)") +
   theme_classic() +
   theme(
     panel.border    = element_rect(color = "black", fill = NA, linewidth = 0.5),
     axis.line       = element_blank(),
-    axis.text.x     = element_text(face = "bold", size = 11),
-    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    # judul, nama gen, dan judul sumbu-y disamakan: ukuran 11, tidak bold, hitam
+    plot.title      = element_text(hjust = 0.5, face = "plain", size = 11, colour = "black"),
+    axis.text.x     = element_text(face = "plain", size = 11, colour = "black"),
+    axis.title.y    = element_text(face = "plain", size = 11, colour = "black"),
     legend.position = "right"
   )
 
