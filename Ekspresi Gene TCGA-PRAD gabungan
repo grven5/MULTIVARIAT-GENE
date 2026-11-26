@@ -62,7 +62,7 @@ n_table <- table(tcga_all$group_expr)
 cat("Normal:", n_table["Normal"], "| Tumor:", n_table["Tumor"], "\n")
 if (n_table["Normal"] == 0) stop("Tidak ada sampel Normal.")
 
-# ── SKOR GABUNGAN 8 GEN (rata-rata z-score) ───────────────────
+# ── SKOR GABUNGAN (rata-rata z-score) ───────────────────
 z_mat <- scale(as.matrix(tcga_all[, gen_ada]))     # z-score per gen, semua sampel
 tcga_all$skor_gabungan <- rowMeans(z_mat)
 
@@ -91,7 +91,7 @@ p_skor <- ggplot(tcga_all, aes(x = group_expr, y = skor_gabungan)) +
     paste0("Normal\n(n=", n_table["Normal"], ")"),
     paste0("Tumor\n(n=", n_table["Tumor"], ")")
   )) +
-  labs(title = paste0("TCGA-PRAD", length(gen_ada), " gen"),
+  labs(title = paste0("TCGA-PRAD"),
        x = "",
        y = "mean z-score (log2 TPM+1)") +
   theme_classic() +
