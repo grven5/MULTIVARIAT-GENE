@@ -1,0 +1,120 @@
+library(ggplot2)
+library(ggpubr)
+
+# ── GEN TARGET ────────────────────────────────────────────────
+gene_targets <- c("AKT1", "MTOR", "HDAC1", "MMP9",
+                  "HSP90AB1", "CCNA2", "RELA", "CDK4")
+
+# ── DATA: bangun dari prad_raw + expr_matrix ──────────────────
+meta <- as.data.frame(SummarizedExperiment::colData(prad_raw))
+ids  <- colnames(expr_matrix)
+
+idx <- match(ids, rownames(meta))
+if (all(is.na(idx)) && "barcode" %in% names(meta)) idx <- match(ids, meta$barcode)
+if (all(is.na(idx))) stop("colnames(expr_matrix) tidak cocok dengan colData(prad_raw)")
+sample_type <- as.character(meta$sample_type[idx])
+
+gi <- if (exists("gene_info")) as.data.frame(gene_info) else
+  as.data.frame(SummarizedExperiment::rowData(prad_raw))
+
+cari_baris <- function(gen) {
+  baris <- NULL
+  if (all(c("gene_id", "gene_name") %in% names(gi))) {
+    cand <- intersect(gi$gene_id[which(gi$gene_name == gen)], rownames(expr_matrix))
+    if (length(cand) > 0) baris <- cand[1]
+  }
+  if (is.null(baris) && gen %in% rownames(expr_matrix)) baris <- gen
+  baris
+}
+
+baris_gen  <- sapply(gene_targets, cari_baris)
+gen_hilang <- gene_targets[vapply(baris_gen, is.null, logical(1))]
+if (length(gen_hilang) > 0) {
+  cat("⚠️ Gen tidak ditemukan, dilewati:", paste(gen_hilang, collapse = ", "), "\n")
+}
+gen_ada   <- setdiff(gene_targets, gen_hilang)
+baris_gen <- unlist(baris_gen[gen_ada])
+if (length(gen_ada) == 0) stop("Tidak ada gen yang ditemukan di expr_matrix")
+
+mat <- t(as.matrix(expr_matrix[baris_gen, , drop = FALSE]))
+colnames(mat) <- gen_ada
+
+maks <- max(mat, na.rm = TRUE)
+cat("Nilai maksimum semua gen sebelum transformasi:", maks, "\n")
+if (maks > 50) {
+  mat <- log2(mat + 1)
+  cat("→ dilakukan log2(x+1)\n")
+} else {
+  cat("→ data dianggap sudah dalam skala log, tidak ditransformasi\n")
+}
+
+tcga_all <- data.frame(sample_id = ids, sample_type = sample_type,
+                       stringsAsFactors = FALSE)
+tcga_all <- cbind(tcga_all, as.data.frame(mat))
+
+tcga_all$group_expr <- ifelse(tcga_all$sample_type == "Primary Tumor", "Tumor",
+                       ifelse(tcga_all$sample_type == "Solid Tissue Normal", "Normal", NA))
+tcga_all <- tcga_all[!is.na(tcga_all$group_expr), ]
+tcga_all <- tcga_all[complete.cases(tcga_all[, gen_ada]), ]
+tcga_all$group_expr <- factor(tcga_all$group_expr, levels = c("Normal", "Tumor"))
+
+n_table <- table(tcga_all$group_expr)
+cat("Normal:", n_table["Normal"], "| Tumor:", n_table["Tumor"], "\n")
+if (n_table["Normal"] == 0) stop("Tidak ada sampel Normal.")
+
+# ── SKOR GABUNGAN 8 GEN (rata-rata z-score) ───────────────────
+z_mat <- scale(as.matrix(tcga_all[, gen_ada]))     # z-score per gen, semua sampel
+tcga_all$skor_gabungan <- rowMeans(z_mat)
+
+# Statistik
+v_n <- tcga_all$skor_gabungan[tcga_all$group_expr == "Normal"]
+v_t <- tcga_all$skor_gabungan[tcga_all$group_expr == "Tumor"]
+uji <- wilcox.test(v_t, v_n)
+auc <- as.numeric(uji$statistic) / (length(v_t) * length(v_n))
+
+cat("\n=== SKOR GABUNGAN ", length(gen_ada), " GEN ===\n", sep = "")
+cat("Median Normal:", round(median(v_n), 3), "| Median Tumor:", round(median(v_t), 3), "\n")
+cat("Wilcoxon p   :", format(signif(uji$p.value, 3), scientific = TRUE), "\n")
+cat("AUC          :", round(auc, 3), "\n")
+
+# ── BOXPLOT: 1 GRAFIK, NORMAL vs TUMOR ────────────────────────
+warna <- c("Normal" = "#3D84D6", "Tumor" = "#F08C00")
+
+p_skor <- ggplot(tcga_all, aes(x = group_expr, y = skor_gabungan)) +
+  geom_boxplot(aes(fill = group_expr), width = 0.6, outlier.shape = NA,
+               colour = "black", linewidth = 0.5, alpha = 0.5) +
+  geom_jitter(aes(colour = group_expr), width = 0.2, alpha = 0.7, size = 1.5) +
+  stat_compare_means(method = "wilcox.test", label = "p.format", size = 4) +
+  scale_fill_manual(values = warna, name = "Group") +
+  scale_colour_manual(values = warna, guide = "none") +
+  scale_x_discrete(labels = c(
+    paste0("Normal\n(n=", n_table["Normal"], ")"),
+    paste0("Tumor\n(n=", n_table["Tumor"], ")")
+  )) +
+  labs(title = paste0("TCGA-PRAD", length(gen_ada), " gen"),
+       x = "",
+       y = "mean z-score (log2 TPM+1)") +
+  theme_classic() +
+  theme(
+    panel.border    = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    axis.line       = element_blank(),
+    plot.title      = element_text(hjust = 0.5, face = "plain", size = 11, colour = "black"),
+    axis.text.x     = element_text(face = "plain", size = 11, colour = "black"),
+    axis.title.y    = element_text(face = "plain", size = 11, colour = "black"),
+    legend.position = "right"
+  )
+
+print(p_skor)
+
+# ── SIMPAN ────────────────────────────────────────────────────
+if (!exists("downloads_path")) {
+  downloads_path <- file.path(path.expand("~"), "Downloads")
+  if (!dir.exists(downloads_path)) downloads_path <- getwd()
+}
+
+ggsave(file.path(downloads_path, "EXP_TCGA_PRAD_skor_8gen.png"),
+       plot = p_skor, width = 6, height = 6, dpi = 300)
+write.csv(tcga_all[, c("sample_id", "sample_type", "group_expr", gen_ada, "skor_gabungan")],
+          file.path(downloads_path, "Skor_gabungan_8gen_TCGA_PRAD.csv"),
+          row.names = FALSE)
+cat("Tersimpan di:", downloads_path, "\n")
