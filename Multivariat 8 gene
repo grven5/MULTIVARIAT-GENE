@@ -1,0 +1,189 @@
+library(survival)
+library(survminer)
+library(SummarizedExperiment)
+
+# ── GEN TARGET ────────────────────────────────────────────────
+gene_targets <- c("AKT1", "MTOR", "HDAC1", "MMP9",
+                  "HSP90AB1", "CCNA2", "RELA", "CDK4")
+
+# "cox"    = risk score dari model Cox multivariat (8 gen sekaligus)
+# "zscore" = rata-rata z-score 8 gen (tanpa model, lebih stabil kalau event sedikit)
+metode_skor <- "cox"
+
+# ── LOKASI ────────────────────────────────────────────────────
+if (!exists("downloads_path")) {
+  downloads_path <- file.path(Sys.getenv("USERPROFILE"), "Downloads")
+  if (!dir.exists(downloads_path)) {
+    downloads_path <- file.path(Sys.getenv("HOME"), "Downloads")
+  }
+}
+data_dir <- file.path(downloads_path, "TCGA-PRAD")
+
+# ── DATA DASAR ────────────────────────────────────────────────
+if (!exists("tcga_data")) tcga_data <- tcga_prad   # ganti kalau nama objek berbeda
+tcga_data <- as.data.frame(tcga_data)
+
+if (!"sample_type" %in% names(tcga_data)) {
+  kode <- substr(tcga_data$sample_id, 14, 15)
+  tcga_data$sample_type <- ifelse(kode == "01", "Primary Tumor",
+                           ifelse(kode == "11", "Solid Tissue Normal", NA))
+}
+
+# status harus numerik: 1 = meninggal, 0 = sensor
+if (is.character(tcga_data$status) || is.factor(tcga_data$status)) {
+  s <- tolower(as.character(tcga_data$status))
+  tcga_data$status <- ifelse(s %in% c("dead", "deceased", "1"), 1,
+                      ifelse(s %in% c("alive", "living", "0"), 0, NA))
+}
+
+# ── TAMBAHKAN KOLOM GEN KALAU BELUM ADA ───────────────────────
+muat_prad_raw <- function() {
+  if (exists("prad_raw")) return(invisible(TRUE))
+  kandidat <- c(file.path(data_dir, "prad_raw.rds"),
+                file.path(downloads_path, "prad_raw.rds"))
+  kandidat <- kandidat[file.exists(kandidat)]
+  if (length(kandidat) == 0) return(invisible(FALSE))
+  prad_raw <<- readRDS(kandidat[1])
+  invisible(TRUE)
+}
+
+gen_ada <- c()
+for (g in gene_targets) {
+  col_g <- paste0(g, "_expr")
+  if (!col_g %in% names(tcga_data)) {
+    if (!muat_prad_raw()) stop("prad_raw.rds tidak ditemukan di ", data_dir)
+    gi  <- as.data.frame(rowData(prad_raw))
+    idx <- match(g, gi$gene_name)
+    if (is.na(idx)) {
+      cat("⚠️ Gen", g, "tidak ditemukan di rowData, dilewati\n")
+      next
+    }
+    nilai <- log2(as.numeric(assay(prad_raw, "tpm_unstrand")[idx, ]) + 1)
+    tcga_data[[col_g]] <- nilai[match(tcga_data$sample_id, colnames(prad_raw))]
+    cat("Kolom", col_g, "ditambahkan ke tcga_data\n")
+  }
+  gen_ada <- c(gen_ada, g)
+}
+if (length(gen_ada) < 2) stop("Gen yang tersedia kurang dari 2")
+kolom_gen <- paste0(gen_ada, "_expr")
+
+# ── DATA SURVIVAL: Primary Tumor, satu baris per pasien ──────
+surv_data <- tcga_data[which(tcga_data$sample_type == "Primary Tumor"), ]
+surv_data$patient_id <- substr(surv_data$sample_id, 1, 12)
+surv_data <- surv_data[order(surv_data$patient_id, surv_data$sample_id), ]
+surv_data <- surv_data[!duplicated(surv_data$patient_id), ]
+surv_data <- surv_data[!is.na(surv_data$time) & surv_data$time > 0 &
+                       !is.na(surv_data$status), ]
+surv_data <- surv_data[complete.cases(surv_data[, kolom_gen]), ]
+
+n_event <- sum(surv_data$status)
+cat("\nJumlah pasien:", nrow(surv_data), "| Event (meninggal):", n_event, "\n")
+if (n_event < 10 * length(gen_ada)) {
+  cat("⚠️ Event (", n_event, ") jauh di bawah 10 x jumlah gen (",
+      10 * length(gen_ada), "). Model Cox ", length(gen_ada),
+      " gen berisiko overfit; interpretasi dengan hati-hati.\n", sep = "")
+}
+
+# ── RISK SCORE MULTIVARIAT ────────────────────────────────────
+tabel_cox <- NULL
+skor_ok   <- FALSE
+
+if (metode_skor == "cox") {
+  rumus   <- reformulate(kolom_gen, response = "Surv(time, status)")
+  fit_cox <- tryCatch(coxph(rumus, data = surv_data), error = function(e) NULL)
+
+  if (!is.null(fit_cox) && all(is.finite(coef(fit_cox)))) {
+    surv_data$risk_score <- as.numeric(predict(fit_cox, newdata = surv_data, type = "lp"))
+    sm <- summary(fit_cox)
+    tabel_cox <- data.frame(
+      Gen      = gen_ada,
+      Koefisien = round(sm$coefficients[, "coef"], 4),
+      HR       = round(sm$conf.int[, "exp(coef)"], 3),
+      CI95_low = round(sm$conf.int[, "lower .95"], 3),
+      CI95_high = round(sm$conf.int[, "upper .95"], 3),
+      p        = signif(sm$coefficients[, "Pr(>|z|)"], 3),
+      row.names = NULL
+    )
+    cat("\n=== MODEL COX MULTIVARIAT ===\n")
+    print(tabel_cox)
+    cat("C-index:", round(sm$concordance[1], 3), "\n")
+    skor_ok <- TRUE
+  } else {
+    cat("⚠️ Model Cox gagal/tidak konvergen. Beralih ke rata-rata z-score.\n")
+  }
+}
+
+if (!skor_ok) {
+  z_mat <- scale(as.matrix(surv_data[, kolom_gen, drop = FALSE]))
+  surv_data$risk_score <- rowMeans(z_mat, na.rm = TRUE)
+  metode_skor <- "zscore"
+}
+
+label_skor <- ifelse(metode_skor == "cox",
+                     paste0(length(gen_ada), "-gene risk score"),
+                     paste0(length(gen_ada), "-gene mean z-score"))
+
+surv_data$group <- ifelse(surv_data$risk_score > median(surv_data$risk_score),
+                          "High", "Low")
+surv_data$group <- factor(surv_data$group, levels = c("Low", "High"))
+
+cat("\nJumlah pasien:", nrow(surv_data), "\n")
+print(table(surv_data$group, surv_data$status))
+
+# ── FIT & PLOT ────────────────────────────────────────────────
+fit   <- survfit(Surv(time, status) ~ group, data = surv_data)
+p_val <- surv_pvalue(fit, data = surv_data)$pval
+
+cox_grup <- tryCatch(summary(coxph(Surv(time, status) ~ group, data = surv_data)),
+                     error = function(e) NULL)
+if (!is.null(cox_grup)) {
+  cat("HR High vs Low:", round(cox_grup$conf.int[1, "exp(coef)"], 3),
+      "(95% CI", round(cox_grup$conf.int[1, "lower .95"], 3), "-",
+      round(cox_grup$conf.int[1, "upper .95"], 3), ")\n")
+}
+
+p_km <- ggsurvplot(
+  fit, data = surv_data,
+  pval = paste("p =", format(p_val, scientific = TRUE, digits = 3)),
+  pval.method = TRUE,
+  pval.size = 3.5,
+  pval.method.size = 3.5,
+  risk.table = TRUE,
+  risk.table.col = "strata",
+  risk.table.fontsize = 3,
+  risk.table.height = 0.25,
+  palette = c("#2E9FDF", "#E74C3C"),
+  title = "TCGA-PRAD",
+  xlab = "Time (days)",
+  ylab = "Overall Survival Probability",
+  legend.title = label_skor,
+  legend.labs = c("Low", "High"),
+  font.main = c(10),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(9, "plain"),
+  font.legend = c(9, "plain"),
+  conf.int = FALSE,
+  censor.size = 3,
+  ggtheme = theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5,
+                                    face = "bold",
+                                    size = 12)),
+  tables.theme = theme_survminer(font.main = 10, font.x = 10,
+                                 font.y = 10, font.tickslab = 9)
+)
+
+print(p_km)
+
+# ── SIMPAN ────────────────────────────────────────────────────
+out_file <- file.path(downloads_path, "1_KM_TCGA_PRAD_8gen_multivariat.png")
+png(out_file, width = 8, height = 6, units = "in", res = 300)
+print(p_km)
+dev.off()
+cat("Gambar disimpan di:", out_file, "\n")
+
+if (!is.null(tabel_cox)) {
+  write.csv(tabel_cox, file.path(downloads_path, "Cox_multivariat_8gen_TCGA_PRAD.csv"),
+            row.names = FALSE)
+  cat("Tabel Cox disimpan di:", file.path(downloads_path, "Cox_multivariat_8gen_TCGA_PRAD.csv"), "\n")
+}
